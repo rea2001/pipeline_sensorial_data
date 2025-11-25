@@ -1,0 +1,5 @@
+# Lista de dependencias
+pip show pandas psycopg2-binary
+pip install pandas psycopg2-binary
+pip install psycopg2
+pip install sqlalchemy
