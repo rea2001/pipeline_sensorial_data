@@ -79,7 +79,7 @@ def load_via_by_asset_motor(
     }
     for key, value in params.items():
         etiqueta = etiquetas.get(key, key.capitalize())
-        print(f"| {etiqueta:<25}: {value}")
+        print(f" {etiqueta:<25}: {value}")
 
     #print("GET :", params)
 

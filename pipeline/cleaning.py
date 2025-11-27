@@ -27,35 +27,40 @@ def classify_variable_group(var_name: str) -> str:
 
 def compute_vibration_stats(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Calcula estadísticos y percentiles p50/p95/p99
-    SOLO para variables de vibración (Grupo 1),
-    asumiendo que df corresponde a un despliegue.
+    Calcula estadísticos descriptivos e IQR para variables de vibración.
+
+    - Aplica solo a VIBRATION_VARS.
+    - Devuelve, por variable:
+        count, mean, std, min, q1, q3, iqr, max
     """
     df_vib = df[df["variable"].isin(VIBRATION_VARS)].copy()
     df_vib["valor"] = pd.to_numeric(df_vib["valor"], errors="coerce")
     df_vib = df_vib.dropna(subset=["valor"])
 
     if df_vib.empty:
-        return pd.DataFrame(columns=["variable", "count", "mean", "std",
-                                     "min", "p50", "p95", "p99", "max"])
+        return pd.DataFrame(columns=[
+            "variable", "count", "mean",
+            "min", "q1", "q3", "iqr", "max"
+        ])
 
+    # Estadísticos básicos
     stats = df_vib.groupby("variable")["valor"].agg(
         count="count",
         mean="mean",
-        std="std",
         min="min",
         max="max",
     )
 
-    p50 = df_vib.groupby("variable")["valor"].quantile(0.50)
-    p95 = df_vib.groupby("variable")["valor"].quantile(0.95)
-    p99 = df_vib.groupby("variable")["valor"].quantile(0.99)
+    # Cuartiles e IQR
+    q1 = df_vib.groupby("variable")["valor"].quantile(0.25)
+    q3 = df_vib.groupby("variable")["valor"].quantile(0.75)
+    iqr = q3 - q1
 
-    stats["p50"] = p50
-    stats["p95"] = p95
-    stats["p99"] = p99
+    stats["q1"] = q1
+    stats["q3"] = q3
+    stats["iqr"] = iqr
 
-    stats = stats[["count", "mean", "std", "min", "p50", "p95", "p99", "max"]]
+    stats = stats[["count", "mean", "min","max", "q1", "q3", "iqr"]]
     return stats.reset_index()
 
 
@@ -90,8 +95,19 @@ def mark_invalid_physical(df: pd.DataFrame) -> pd.DataFrame:
 
 def mark_vibration_outliers(df: pd.DataFrame, stats: pd.DataFrame) -> pd.DataFrame:
     """
-    Marca valores altos y extremos en variables de vibración
-    usando p95 y p99 por variable.
+    Marca valores altos y extremos en variables de vibración usando IQR.
+
+    Criterio por variable:
+      - Se calculan Q1, Q3, IQR a partir de compute_vibration_stats().
+      - Zona alta (is_high=True):
+          valor < Q1 - 1.5*IQR  o  valor > Q3 + 1.5*IQR
+        (siempre que no sea extremo)
+      - Outlier extremo (is_outlier=True):
+          valor < Q1 - 3*IQR  o  valor > Q3 + 3*IQR
+
+    NOTA:
+      - is_outlier tiene prioridad: si es outlier, no se marca como high.
+      - Si IQR <= 0 o faltan Q1/Q3, no se marcan flags para esa variable.
     """
     df_out = df.copy()
     df_out["is_high"] = False
@@ -100,9 +116,12 @@ def mark_vibration_outliers(df: pd.DataFrame, stats: pd.DataFrame) -> pd.DataFra
     if stats.empty:
         return df_out
 
-    p95_map: Dict[str, float] = dict(zip(stats["variable"], stats["p95"]))
-    p99_map: Dict[str, float] = dict(zip(stats["variable"], stats["p99"]))
+    # Mapas por variable
+    q1_map: Dict[str, float] = dict(zip(stats["variable"], stats["q1"]))
+    q3_map: Dict[str, float] = dict(zip(stats["variable"], stats["q3"]))
+    iqr_map: Dict[str, float] = dict(zip(stats["variable"], stats["iqr"]))
 
+    # Filtramos solo variables de vibración
     mask_vib = df_out["variable"].isin(VIBRATION_VARS)
     df_vib = df_out[mask_vib].copy()
     df_vib["valor"] = pd.to_numeric(df_vib["valor"], errors="coerce")
@@ -110,14 +129,33 @@ def mark_vibration_outliers(df: pd.DataFrame, stats: pd.DataFrame) -> pd.DataFra
     def _flags(row):
         var = row["variable"]
         val = row["valor"]
+
         if pd.isna(val):
             return False, False
-        p95 = p95_map.get(var)
-        p99 = p99_map.get(var)
-        if p95 is None or p99 is None:
+
+        q1 = q1_map.get(var)
+        q3 = q3_map.get(var)
+        iqr = iqr_map.get(var)
+
+        # Si falta algo o IQR no es positivo, no marcamos
+        if q1 is None or q3 is None or iqr is None or iqr <= 0:
             return False, False
-        is_out = val > p99
-        is_high = (val > p95) and (val <= p99)
+
+        # Umbrales
+        low_high = q1 - 1.5 * iqr
+        high_high = q3 + 1.5 * iqr
+
+        low_out = q1 - 3.0 * iqr
+        high_out = q3 + 3.0 * iqr
+
+        # Outlier extremo
+        is_out = (val < low_out) or (val > high_out)
+
+        # Zona alta (solo si no es extremo)
+        is_high = False
+        if not is_out and (val < low_high or val > high_high):
+            is_high = True
+
         return is_high, is_out
 
     flags = df_vib.apply(_flags, axis=1, result_type="expand")
@@ -127,7 +165,6 @@ def mark_vibration_outliers(df: pd.DataFrame, stats: pd.DataFrame) -> pd.DataFra
     df_out.loc[mask_vib, "is_outlier"] = flags["is_outlier_tmp"].values
 
     return df_out
-
 
 def mark_categorical_invalid(df: pd.DataFrame) -> pd.DataFrame:
     """

@@ -50,5 +50,27 @@ CATEGORICAL_DOMAINS = {
     "Unbalance (BETA)": {0, 1},
     "Misalignment (BETA)": {0, 1},
     "Looseness (BETA)": {0, 1},
-    "Number of Starts Between Measurements": {0, 1},
+    "Number of Starts Between Measurements": {0, 1,2},
 }
+
+QUALITY_LABELS = {
+        0: "OK",
+        1: "Valor faltante",
+        2: "Gap temporal",
+        3: "Valor extremo",
+        4: "Categoría inválida",
+        5: "Valor imposible",
+        6: "Error de integridad en contador",
+        9: "Error desconocido",
+}
+
+flag_cols = [
+        "is_missing",
+        "is_invalid_physical",
+        "is_high", # para feacture
+        "is_outlier",
+        "is_invalid_category",
+        "is_invalid_monotonic",
+        "is_gap",           # viene de df_with_flags / para feature
+        "is_small_delta",   # también temporal / para feature
+]
