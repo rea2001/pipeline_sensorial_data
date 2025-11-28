@@ -1,5 +1,18 @@
+
+# Variable principal para análisis espectral
+MAIN_SIGNAL_VAR = "Acceleration RMS (Radial)"
+
+# Tamaño de ventana en segundos (2 horas = 7200 s)
+FEATURE_WINDOW_S = 7200
+
+# Número mínimo de muestras "buenas" (quality_code == 0) para aceptar una ventana
+MIN_SAMPLES_PER_WINDOW = 4
+
+
+
+
 # =====================================================
-# 1) Definición de grupos de variables
+# Definición de grupos de variables
 # =====================================================
 
 # Grupo 1: continuas físicas de vibración

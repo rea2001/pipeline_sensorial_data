@@ -4,6 +4,8 @@ from diagnostic_temporal import preparar_estructura_temporal, agregar_flags_temp
 from cleaning import limpiar_por_variable
 from conf import QUALITY_LABELS, flag_cols
 from load_mediciones import guardar_mediciones
+from features import generar_caracteristicas_despliegue 
+from load_features import  post_with_bulk
 
 
 def pausar_y_continuar(mensaje="Presione ENTER para continuar..."):
@@ -111,14 +113,13 @@ def main():
             print(f"  {col}: (no existe en el DataFrame)")
 
     codigos_disponibles = list(quality_counts.keys())
-    print("\n=== VISUALIZACIÓN DETALLADA DE DATOS DE CALIDAD ===\n")
+    print("\n=== VISUALIZACIÓN DETALLADA DE DATOS CON INDICADOR DE CALIDAD ASIGNADO ===\n")
     print(f"Códigos de Calidad disponibles para inspeccionar: {codigos_disponibles}")
     
     while True:
         user_input = input("\nCódigo a inspeccionar (o ENTER para salir): ")
 
         if not user_input:
-            print("\nSaliendo de la sección de inspección de códigos de calidad.")
             break        
         try:
             target_code = int(user_input)
@@ -142,26 +143,33 @@ def main():
     # OPCIÓN: GUARDAR EN iot.mediciones
     # ============================
     resp = input(
-        "\n¿Desea guardar estas mediciones en iot.mediciones vía API? (s/n) "
+        "\n¿DESEA GUARDAR LAS MEDICIONES LIMPIAS VÍA API? (s/n) "
     ).strip().lower()
 
     if resp == "s":
-        # Puedes elegir qué códigos de calidad quieres guardar
-        # Por ejemplo: solo OK y GAP temporal
-        quality_filter = [0,1,3]
-
-        dry = input("¿Ejecutar en modo prueba (dry-run, sin escribir)? (s/n) ").strip().lower()
-        dry_run = (dry == "s")
-
+        quality_filter = None
         guardar_mediciones(
-            df_limpio=df_limpio,
+            df_limpio,
             quality_filter=quality_filter,
-            dry_run=dry_run,
         )
     else:
-        print("No se enviaron mediciones a la API.")
+     print("\nNo se enviaron mediciones a la base de datos")
 
+    pausar_y_continuar("\nPresione ENTER para generar CARACTERÍSTICAS de la señal principal...")
 
+    df_feats = generar_caracteristicas_despliegue(df_limpio)
+
+    print("\n=== CARACTERÍSTICAS GENERADAS ===\n")
+    print(df_feats.head(20))        
+    print(f"\nTotal de filas de características generadas: {len(df_feats)}")
+    resp = input(
+        "\n¿DESEA GUARDAR FEATURE VÍA API? (s/n) "
+    ).strip().lower()
+    if resp == "s":
+        inserted, skipped = post_with_bulk(df_feats, batch_size=500, timeout=120)
+ 
+    else:
+     print("\nNo se enviaron caracteristicas a la base de datos")
 
 if __name__ == "__main__":
     main()

@@ -1,157 +1,165 @@
+import time
+from typing import Optional, Iterable, Tuple
 import pandas as pd
-import datetime as dt
-from typing import Iterable, Optional, Sequence
-from config_api import BASE_MEDICIONES
+import requests
+from config_api import session, headers, auth, BASE_MEDICIONES
 
-from config_api import (
-    API_ROOT,
-    API_PREFIX,
-    session,
-    headers,
-    auth,
-)
+# Timeout: (connect_timeout, read_timeout)
+TIMEOUT = (5, 120)
+MAX_RETRIES = 5
 
-def _to_iso_utc(ts) -> str:
+
+def post_with_retry(payload: dict) -> Tuple[bool, Optional[int]]:
     """
-    Convierte un timestamp a ISO 8601 con timezone.
-    Asume que ya viene como datetime con tzinfo=UTC o similar.
+    Envía una medición al endpoint /mediciones con reintentos.
+    
+    Retorna:
+      (ok, status_code)
     """
-    if isinstance(ts, dt.datetime):
-        # Si no tiene tzinfo, asumimos UTC
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=dt.timezone.utc)
-        return ts.isoformat()
-    # Si viene como string, lo enviamos tal cual (idealmente no pasa)
-    return str(ts)
+    url = f"{BASE_MEDICIONES}/"
 
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            r = session.post(
+                url,
+                json=payload,
+                headers=headers,
+                auth=auth,
+                timeout=TIMEOUT,
+            )
 
-def construir_payload_medicion(row: pd.Series) -> dict:
-    """
-    Construye el JSON para el POST /mediciones a partir de una fila del df_limpio.
-    Requiere que el DataFrame tenga:
-      - despliegue_id
-      - ts_utc
-      - variable
-      - valor
-      - quality_code (que mapeamos a indicador_calidad)
-    """
-    despliegue_id = int(row["despliegue_id"])
-    ts_utc = _to_iso_utc(row["ts_utc"])
-    variable = str(row["variable"])
+            # Caso éxito normal
+            if r.status_code in (200, 201):
+                return True, r.status_code
 
-    # valor puede ser NaN
-    valor = row.get("valor", None)
-    if pd.isna(valor):
-        valor = None
-    else:
-        # Convertimos a float explícito para JSON
-        valor = float(valor)
+            # Caso conflicto por duplicado: lo tratamos como "ok lógico"
+            if r.status_code == 409:
+                print(f"⚠ Medición duplicada (409). Se omite pero se considera OK lógico.")
+                return True, r.status_code
 
-    quality_code = int(row.get("quality_code", 0))
+            # Otros errores HTTP
+            print(f"⚠ Error HTTP {r.status_code}: {r.text}")
+        except requests.exceptions.ReadTimeout:
+            print(f"⏳ ReadTimeout en intento {attempt}")
+        except requests.exceptions.ConnectionError as e:
+            print(f"💥 Error de conexión en intento {attempt}: {e}")
 
-    payload = {
-        "despliegue_id": despliegue_id,
-        "ts_utc": ts_utc,
-        "variable": variable,
-        "valor": valor,
-        "indicador_calidad": quality_code,
-    }
-    return payload
+        # Si llegó aquí, reintentamos
+        sleep_time = 2 * attempt
+        print(f"⏳ Reintentando en {sleep_time} segundos...")
+        time.sleep(sleep_time)
 
-
-def post_medicion(payload: dict) -> int:
-    """
-    Envía una medición individual al endpoint POST /mediciones.
-    Devuelve el status_code de la respuesta.
-    Lanza excepción si no es 2xx.
-    """
-    url = BASE_MEDICIONES
-    r = session.post(url, json=payload, headers=headers, auth=auth, timeout=(5,120))
-
-    if r.status_code not in (200, 201):
-        # Log sencillo; si quieres puedes imprimir r.text
-        raise RuntimeError(f"Error al crear medición: {r.status_code} - {r.text}")
-
-    return r.status_code
+    # Si se agotaron los reintentos:
+    print("❌ Falló definitivamente después de varios intentos.")
+    return False, None
 
 
 def guardar_mediciones(
     df_limpio: pd.DataFrame,
-    quality_filter: Optional[Sequence[int]] = None,
-    dry_run: bool = False,
-) -> None:
+    quality_filter: Optional[Iterable[int]] = None,
+) -> Tuple[int, int, int]:
     """
-    Recorre df_limpio y envía las mediciones a /mediciones.
+    Envía mediciones limpias a la API /api/mediciones.
 
     Parámetros:
-      - df_limpio:
-          DataFrame resultante de limpiar_por_variable().
-          Debe tener:
-            despliegue_id, ts_utc, variable, valor, quality_code
-      - quality_filter:
-          Secuencia de códigos de calidad a incluir.
-          Por ejemplo:
-             [0]        -> solo mediciones OK
-             [0, 2]     -> OK + gap temporal
-             None       -> todas las mediciones
-      - dry_run:
-          Si True, no hace POST, solo muestra cuántas se enviarían.
+      df_limpio:
+        DataFrame con, al menos:
+          - despliegue_id
+          - ts_utc (datetime)
+          - variable (str)
+          - valor (num o NaN)
+          - quality_code (int)
+      quality_filter:
+        - None  → se guardan TODAS las filas.
+        - [0]   → solo filas con quality_code == 0.
+        - [0,3] → solo filas con quality_code en ese conjunto, etc.
 
-    Imprime un pequeño resumen al final.
+    Retorna:
+      (insertadas_ok, duplicadas_o_skipped_ok, fallidas)
     """
     if df_limpio.empty:
-        print("⚠ No hay mediciones para guardar (df_limpio está vacío).")
-        return
+        print("⚠ df_limpio está vacío. No hay nada que guardar.")
+        return 0, 0, 0
 
-    required_cols = {"despliegue_id", "ts_utc", "variable", "valor", "quality_code"}
-    missing = required_cols - set(df_limpio.columns)
-    if missing:
-        raise ValueError(f"Faltan columnas requeridas en df_limpio: {missing}")
+    # ------------------------------
+    # Aplicar filtro de calidad
+    # ------------------------------
+    if quality_filter is None:
+        df_a_guardar = df_limpio.copy()
+        print(f"→ Guardando TODAS las {len(df_a_guardar)} mediciones procesadas")
+    else:
+        df_a_guardar = df_limpio[df_limpio["quality_code"].isin(quality_filter)]
+        if df_a_guardar.empty:
+            print("No hay mediciones que cumplan el filtro de quality_code.")
+            return 0, 0, 0
+        print(
+            f"→ Guardando {len(df_a_guardar)} mediciones con quality_code en {list(quality_filter)} "
+            f"de un total de {len(df_limpio)}."
+        )
 
-    df_to_send = df_limpio.copy()
+    insertadas_ok = 0
+    duplicadas_o_skipped = 0
+    fallidas = 0
 
-    # Filtrar por indicador_calidad si se pasó quality_filter
-    if quality_filter is not None:
-        df_to_send = df_to_send[df_to_send["quality_code"].isin(quality_filter)]
+    total = len(df_a_guardar)
+    print(f"\n=== INICIO DE CARGA A /api/mediciones ===\n")
+    print(f"Total de filas a enviar: {total}\n")
 
-    total = len(df_to_send)
-    if total == 0:
-        print("⚠ No hay mediciones que cumplan el filtro de quality_code.")
-        return
+    for idx, row in df_a_guardar.reset_index(drop=True).iterrows():
+        # Construir payload para la API
+        try:
+            despliegue_id = int(row["despliegue_id"])
+        except KeyError:
+            raise KeyError("El DataFrame debe tener la columna 'despliegue_id'.")
+        except ValueError:
+            raise ValueError(f"Valor inválido de despliegue_id en fila {idx}: {row['despliegue_id']}")
 
-    print(f"\n=== INICIO DE CARGA A /mediciones ===")
-    print(f"Total de mediciones a procesar: {total}")
-    if quality_filter is not None:
-        print(f"Filtro de quality_code aplicado: {list(quality_filter)}")
-    if dry_run:
-        print("Modo DRY-RUN activado: no se enviarán POST reales.\n")
-
-    ok_count = 0
-    error_count = 0
-
-    for idx, row in df_to_send.iterrows():
-        payload = construir_payload_medicion(row)
-
-        if dry_run:
-            # Para debug: muestra las primeras filas
-            if ok_count < 3:
-                print(f"[DRY-RUN] Ejemplo de payload: {payload}")
-            ok_count += 1
+        ts_utc = row["ts_utc"]
+        if pd.isna(ts_utc):
+            # Si no hay timestamp, no tiene sentido enviarla
+            print(f"⚠ Fila {idx}: ts_utc es NaN. Se omite.")
+            fallidas += 1
             continue
 
-        try:
-            status = post_medicion(payload)
-            ok_count += 1
-            # Si quieres feedback, puedes imprimir cada N filas:
-            if ok_count % 500 == 0:
-                print(f"  ...{ok_count} mediciones enviadas correctamente")
-        except Exception as e:
-            error_count += 1
-            print(f"❌ Error al enviar medición idx={idx}: {e}")
+        if not hasattr(ts_utc, "isoformat"):
+            # Aseguramos que sea datetime
+            ts_utc = pd.to_datetime(ts_utc)
 
-    print("\n=== RESUMEN CARGA /mediciones ===")
-    print(f"Enviadas correctamente: {ok_count}")
-    print(f"Con error:             {error_count}")
-    print(f"Total procesadas:      {ok_count + error_count}")
-    if dry_run:
-        print("*(Modo DRY-RUN: no se realizaron inserciones reales en la BD)*")
+        valor = row.get("valor", None)
+        if pd.isna(valor):
+            valor_json = None
+        else:
+            valor_json = float(valor)
+
+        quality_code = int(row.get("quality_code", 0))
+
+        payload = {
+            "despliegue_id": despliegue_id,
+            "ts_utc": ts_utc.isoformat(),
+            "variable": str(row["variable"]),
+            "valor": valor_json,
+            "indicador_calidad": quality_code,
+        }
+
+        ok, status = post_with_retry(payload)
+
+        if ok:
+            if status == 409:
+                duplicadas_o_skipped += 1
+            else:
+                insertadas_ok += 1
+        else:
+            fallidas += 1
+            print(f"❌ Error al enviar medición idx={idx} (ts_utc={ts_utc}, variable={row['variable']})")
+
+        # Log simple de progreso
+        if (idx + 1) % 500 == 0:
+            print(f"   → Progreso: {idx + 1}/{total} filas procesadas...")
+
+    print("\n=== RESUMEN CARGA MEDICIONES ===")
+    print(f"Insertadas OK.............: {insertadas_ok}")
+    print(f"Duplicadas/omitidas.......: {duplicadas_o_skipped}")
+    print(f"Fallidas..................: {fallidas}")
+    print("================================\n")
+
+    return insertadas_ok, duplicadas_o_skipped, fallidas
