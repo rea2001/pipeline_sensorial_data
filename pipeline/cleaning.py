@@ -2,6 +2,40 @@ import pandas as pd
 from typing import Dict, Tuple, Optional
 from conf import VIBRATION_VARS, PHYSICAL_VARS, CATEGORICAL_VARS, ACCUMULATIVE_VARS,CATEGORICAL_DOMAINS
 
+
+# phase2_flags.py
+
+import pandas as pd
+from typing import List
+
+FLAG_AS_MISSING_COLS = [
+    "is_invalid_physical",
+    "is_invalid_category",
+    "is_invalid_monotonic",
+    "is_outlier",
+    "is_missing"
+    # podrías incluir aquí otras flags que quieras tratar como faltantes
+]
+
+def aplicar_flags_a_nan(df_limpio: pd.DataFrame) -> pd.DataFrame:
+    if df_limpio.empty:
+        return df_limpio.copy()
+
+    df = df_limpio.copy()
+
+    if "valor" not in df.columns:
+        raise ValueError("Falta la columna 'valor' en df_limpio.")
+
+    mask_severa = False
+    for col in FLAG_AS_MISSING_COLS:
+        if col in df.columns:
+            mask_severa = mask_severa | df[col].astype(bool)
+
+    df.loc[mask_severa, "valor"] = pd.NA
+
+    return df
+
+
 def classify_variable_group(var_name: str) -> str:
     """
     Devuelve el grupo de variable:

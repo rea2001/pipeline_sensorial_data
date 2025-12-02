@@ -1,11 +1,14 @@
 
 from despliegue import cargar_datos_despliegue
-from diagnostic_temporal import preparar_estructura_temporal, agregar_flags_temporales
-from cleaning import limpiar_por_variable
-from conf import QUALITY_LABELS, flag_cols
-from load_mediciones import guardar_mediciones
+from diagnostic_temporal import preparar_estructura_temporal, agregar_flags_temporales, resolver_duplicados_muestras
+from cleaning import limpiar_por_variable, aplicar_flags_a_nan
+from conf import QUALITY_CODES, flag_cols, PROCESSING_CODES
+from load_quality import guardar_mediciones
 from features import generar_caracteristicas_despliegue 
+from imputation import imputar_dataset_ancho, dataset_ancho_a_largo_con_codigos
 from load_features import  post_with_bulk
+from sync_timestamp import construir_dataset_ancho_sin_imputar, assign_time_slots, collapse_by_slot_and_variable
+import os
 
 
 def pausar_y_continuar(mensaje="Presione ENTER para continuar..."):
@@ -19,6 +22,8 @@ def main():
     if df.empty:
         print("No se encontraron datos para ese despliegue.")
         return
+    
+    df = resolver_duplicados_muestras(df)
 
     print("\n=== DATOS CRUDOS DEL DESPLIEGUE ===\n")
     print(df[["ingesta_id","ts_utc", "variable", "valor", "despliegue_id"]].head(10))
@@ -58,17 +63,21 @@ def main():
     else:
         print(small.head())
 
-    pausar_y_continuar("\nPresione ENTER para agregar FLAGS temporales al dataframe...")
+    delta_before = df_gaps["delta_s"].dropna()
+
+    stats_before = delta_before.describe()  # incluye count, mean, std, min, 25%, 50%, 75%, max
+
+    #pausar_y_continuar("\nPresione ENTER para agregar FLAGS temporales al dataframe...")
 
     # ---- Agregar flags temporales al DataFrame principal ----
     df_with_flags = agregar_flags_temporales(df_sorted, df_gaps)
 
-    print("\n=== DATAFRAME ORDENADO CON FLAGS TEMPORALES ===\n")
-    print(df_with_flags[["ts_utc", "variable", "valor", "is_gap", "is_small_delta"]].head(10))
+    #print("\n=== DATAFRAME ORDENADO CON FLAGS TEMPORALES ===\n")
+    #print(df_with_flags[["ts_utc", "variable", "valor", "is_gap", "is_small_delta"]].head(10))
 
     #print("Variables encontradas:", df["variable"].unique())
 
-    pausar_y_continuar("\nPresione ENTER para iniciar la LIMPIEZA por variable...")
+    pausar_y_continuar("\nPresione ENTER para verificar calidad de datos (FASE 1)...")
 
     #dataframe con banderas temporales
     df_limpio, stats_vib = limpiar_por_variable(df_with_flags)
@@ -83,20 +92,20 @@ def main():
             ["ts_utc", "variable", "valor",  "is_missing",
             "is_invalid_physical", "is_high", "is_outlier", 
             "is_invalid_category", "is_invalid_monotonic","quality_code"]
-            ].head(10)
+            ].head()
         )
     
     pausar_y_continuar("\nPresione ENTER para verficar resumen de calidad...")
 
     total_rows = len(df_limpio)
 
-    print(f"\nTOTAL DE MEDICIONES PROCESADAS: {total_rows}\n")
+    print(f"\nTOTAL DE MEDICIONES: {total_rows}\n")
 
     quality_counts = df_limpio["quality_code"].value_counts().sort_index()
    
     print("=== CONTEO POR INDICADOR DE CALIDAD ===\n")
     for code, count in quality_counts.items():
-        label = QUALITY_LABELS.get(code, "Desconocido")
+        label = QUALITY_CODES.get(code, "Desconocido")
         perc = (count / total_rows) * 100 if total_rows > 0 else 0
         print(f"{f'Código {code} ({label})':<25} : {count} filas ({perc:.2f} %)")
     #print(df_limpio[df_limpio["quality_code"] == 2][["ts_utc", "variable", "valor","is_invalid_category", "is_gap", "quality_code"]].head())
@@ -124,7 +133,7 @@ def main():
         try:
             target_code = int(user_input)
             if target_code in codigos_disponibles:
-                label = QUALITY_LABELS.get(target_code, "Desconocido")
+                label = QUALITY_CODES.get(target_code, "Desconocido")
                 
                 print(f"\n=== DATOS CON INDICADOR DE CALIDAD {target_code} ({label}) ===\n")
                 df_sample = df_limpio[df_limpio["quality_code"] == target_code][
@@ -138,12 +147,11 @@ def main():
             # Si la conversión a int falla
             print("\nEntrada no válida. Por favor, ingrese un número entero o presione ENTER para salir.")
     
-
-    # ============================
+ # ============================
     # OPCIÓN: GUARDAR EN iot.mediciones
     # ============================
     resp = input(
-        "\n¿DESEA GUARDAR LAS MEDICIONES LIMPIAS VÍA API? (s/n) "
+        "\n¿DESEA GUARDAR LAS MEDICIONES CON INDICADOR DE CALIDAD EN BDTS? (s/n) "
     ).strip().lower()
 
     if resp == "s":
@@ -154,6 +162,138 @@ def main():
         )
     else:
      print("\nNo se enviaron mediciones a la base de datos")
+
+    #FASE 2: CORRECCIÓN DE ANOMALÍAS 
+
+    pausar_y_continuar(
+        "\nPresione ENTER para construir el DATASET ANCHO (sin imputación, con rejilla de 15 min)..."
+    )
+    
+
+    pausar_y_continuar("\nPresione ENTER para iniciar FASE 2 (IMPUTACIÓN)...")
+
+    # 1) Aplicar flags severas -> NaN
+    df_limpio_nan = aplicar_flags_a_nan(df_limpio)
+    print("ts_utc min:", df_limpio["ts_utc"].min())
+    print("ts_utc max:", df_limpio["ts_utc"].max())
+
+
+    # 2) Construir dataset ancho sin imputar (lo que ya hicimos antes)
+    df_wide, grid = construir_dataset_ancho_sin_imputar(
+        df_limpio_nan,
+        freq="15min",
+        jitter_max_seconds=450,
+    )
+     
+    if not df_wide.empty:
+        idx = df_wide.index.to_series()
+        delta_after = idx.diff().dt.total_seconds().dropna()
+        stats_after = delta_after.describe()
+    
+    if not delta_before.empty and not delta_after.empty:
+        print("\n=== COMPARACIÓN DE Δt ANTES vs DESPUÉS ===\n")
+        print(f"{'Estadística':<20} | {'CRUDA (Antes)':>18} | {'SINCRONIZADA (Después)':>24}")
+        print("-" * 70)
+
+        for stat in ["count", "mean", "std", "min", "25%", "50%", "75%", "max"]:
+            val_before = stats_before.get(stat, None)
+            val_after = stats_after.get(stat, None)
+            print(f"{stat:<20} | {str(round(val_before, 2)) if val_before is not None else 'NA':>18} | {str(round(val_after, 2)) if val_after is not None else 'NA':>24}")
+
+
+    df_slots = assign_time_slots(df_limpio_nan, jitter_max_seconds=450)
+    print("\nFilas originales:", len(df_limpio_nan))
+    print("Filas dentro de jitter:", len(df_slots))
+
+
+    # Índices de las filas que eran outlier en Fase 1
+    outlier_idx = df_limpio.index[df_limpio["is_outlier"]]
+
+    # De esos índices, ¿cuáles siguen presentes en df_slots?
+    survivor_idx = df_slots.index.intersection(outlier_idx)
+
+    print("\nOutliers Fase 1 (total):", len(outlier_idx))
+    print("Outliers que sobreviven a jitter (en df_slots):", len(survivor_idx))
+
+    # Si quieres ver algunos:
+    print("\nMuestra de outliers después de assign_time_slots:")
+    print(df_slots.loc[survivor_idx, ["ts_utc", "ts_slot", "variable", "valor"]].head())
+
+
+    if df_wide.empty:
+        print("\nNo se pudo construir dataset ancho (quizá todos los datos quedaron fuera de tolerancia de jitter).")
+    else:
+        print("\n=== DATASET ANCHO (MUESTRA) ===\n")
+        print(df_wide.head())
+
+        print(f"\nTotal de timestamps en la rejilla: {len(df_wide.index)}")
+        print(f"Rango temporal: {df_wide.index.min()}  ->  {df_wide.index.max()}")
+        
+
+    # 3) Imputación limitada (2 slots)
+    df_wide_imputed, codes_wide = imputar_dataset_ancho(
+        df_wide,
+        max_gap_steps=2,
+    )
+
+    # ============================
+    # OPCIÓN: GUARDAR DATASET ANCHO A CSV
+    # ============================
+    output_dir = "exports_wide"
+    os.makedirs(output_dir, exist_ok=True)
+
+    base_name = f"despliegue_{despliegue_id}"
+
+    # 1) Valores imputados (wide)
+    csv_valores = os.path.join(output_dir, f"{base_name}_wide_valores.csv")
+    df_wide_imputed.to_csv(csv_valores, index=True)
+    print(f"\n[INFO] Dataset ancho de VALORES guardado en: {csv_valores}")
+
+    # 2) Códigos de procesamiento (wide)
+    csv_codigos = os.path.join(output_dir, f"{base_name}_wide_codigos.csv")
+    codes_wide.to_csv(csv_codigos, index=True)
+    print(f"[INFO] Dataset ancho de CÓDIGOS guardado en: {csv_codigos}")
+
+
+    col = "skin_temp"  # o la que quieras
+    s = df_wide[col]
+
+    print("\nSegmentos largos de NaN para", col)
+    is_na = s.isna()
+    grupo = (is_na != is_na.shift()).cumsum()
+
+    for gid, mask_seg in is_na.groupby(grupo):
+        idxs = mask_seg[mask_seg].index
+        if len(idxs) > 2:
+            print(f"Gap de longitud {len(idxs)} desde {idxs[0]} hasta {idxs[-1]}")
+            break
+
+    codes_col = codes_wide[col]
+    print("\nProcessing codes en ese gap:")
+    print(codes_col.loc[idxs].value_counts())
+
+    # 4) Pasar a formato largo con processing_code y nombre ABB
+    df_preproc_long = dataset_ancho_a_largo_con_codigos(
+        df_wide_imputed,
+        codes_wide,
+    )
+
+    total_preproc = len(df_preproc_long)
+
+    print("\n=== MUESTRA DATASET PREPROCESADO (LARGO) ===\n")
+    print(df_preproc_long.head(20))
+
+    print(f"\nTOTAL DE MEDICIONES PREPROCESADAS: {total_preproc}\n")
+
+    if "processing_code" in df_preproc_long.columns and total_preproc > 0:
+            print("=== CONTEO POR INDICADOR DE PROCESAMIENTO (FASE 2) ===\n")
+            proc_counts = df_preproc_long["processing_code"].value_counts().sort_index()
+            for code, count in proc_counts.items():
+                label = PROCESSING_CODES.get(code, "Desconocido")
+                perc = (count / total_preproc) * 100
+                print(f"{f'Código {code} ({label})':<30} : {count} filas ({perc:.2f} %)")
+    else:
+            print("No se encontró la columna 'processing_code' en df_preproc_long.")
 
     pausar_y_continuar("\nPresione ENTER para generar CARACTERÍSTICAS de la señal principal...")
 

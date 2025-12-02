@@ -7,112 +7,40 @@ GAP_FACTOR   = 1.5      # Tolerancia para variaciones o jitter del sensor
 SMALL_DELTA_FACTOR = 0.5  # La mitad del intervalo esperado
 
 
-# --------- Duplicados por clave lógica en raw.ingestas ---------
-
 KEY_COLS_DEFAULT = ["asset_codigo", "motor_codigo", "ts_utc", "variable"]
 VALUE_COL_DEFAULT = "valor"
 
-
-def limpiar_y_marcar_duplicados_ingestas(
+def resolver_duplicados_muestras(
     df: pd.DataFrame,
     key_cols: List[str] = KEY_COLS_DEFAULT,
-    value_col: str = VALUE_COL_DEFAULT,
-) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    keep: str = "last"
+) -> pd.DataFrame:
     """
-    Detecta duplicados en la tabla raw.ingestas (formato largo) usando una clave lógica:
-      key_cols = [asset_codigo, motor_codigo, ts_utc, variable].
+    Elimina duplicados por clave lógica (asset, motor, ts_utc, variable).
 
-    - Elimina duplicados exactos (misma clave + mismo valor).
-    - Caso especial NaN + valor para la misma clave:
-        -> conserva la fila con valor
-        -> descarta las filas con NaN.
-    - Duplicados conflictivos (misma clave, valores distintos no nulos):
-        -> NO se eliminan
-        -> se marcan con is_duplicate_key = True.
+    Estrategia:
+      - Ordena primero por ts_utc (y opcionalmente por ingesta_id si existe).
+      - drop_duplicates(..., keep='last') => nos quedamos con el último valor
+        que asumimos es el más "correcto" o actualizado.
 
     Retorna:
-      df_out  : DataFrame sin duplicados exactos ni NaN sobrantes.
-      resumen : dict con conteos básicos (útil para reportes de calidad).
+      df_sin_dups: DataFrame sin duplicados en la clave lógica.
     """
     if df.empty:
-        return df.copy(), {
-            "num_exact_rows_dropped": 0,
-            "num_nan_dup_dropped": 0,
-            "num_conflictive_rows": 0,
-            "num_keys_with_conflict": 0,
-        }
+        return df
 
-    df = df.copy()
+    sort_cols = ["ts_utc"]
+    if "ingesta_id" in df.columns:
+        sort_cols.append("ingesta_id")
 
-    # Asegurar que exista la columna de valor
-    if value_col not in df.columns:
-        raise ValueError(f"El DataFrame no tiene la columna de valor '{value_col}'.")
+    df_sorted = df.sort_values(sort_cols).reset_index(drop=True)
 
-    # 1) Estadísticas por clave lógica
-    stats = (
-        df.groupby(key_cols, dropna=False)[value_col]
-          .agg(
-              count_rows="size",
-              n_notnull=lambda s: s.notna().sum(),
-              n_unique_nonnull=lambda s: s.dropna().nunique()
-          )
-          .reset_index()
-    )
+    df_sin_dups = df_sorted.drop_duplicates(
+        subset=key_cols,
+        keep=keep
+    ).reset_index(drop=True)
 
-    # Hacer join para que cada fila tenga las estadísticas de su clave
-    df = df.merge(stats, on=key_cols, how="left")
-
-    # 2) Máscaras de grupos
-    mask_dup_group      = df["count_rows"] > 1
-    mask_conflict_group = mask_dup_group & (df["n_unique_nonnull"] > 1)
-
-    # 3) Flag para duplicados conflictivos (valores distintos no nulos)
-    df["is_duplicate_key"] = False
-    df.loc[mask_conflict_group, "is_duplicate_key"] = True
-
-    # 4) Duplicados exactos (misma clave + mismo valor)
-    #    Esto también captura el caso de todos NaN con misma clave, o múltiples
-    #    filas exactamente iguales en la lógica (clave + valor).
-    mask_exact_dup = df.duplicated(subset=key_cols + [value_col], keep="first")
-
-    # 5) Caso especial: grupos con NaN + UN solo valor no nulo
-    #    -> no son conflicto
-    #    -> se descartan los NaN y se conserva la fila con valor.
-    mask_group_one_nonnull = mask_dup_group & (df["n_notnull"] == 1)
-    mask_nan_value         = df[value_col].isna()
-    # filas NaN en claves donde solo existe un valor no nulo
-    mask_nan_dup = mask_group_one_nonnull & mask_nan_value
-
-    # 6) Filas a eliminar:
-    #    - duplicados exactos (copias extra)
-    #    - NaN redundantes cuando hay un solo valor bueno en la clave
-    rows_to_drop = mask_exact_dup | mask_nan_dup
-
-    num_exact_rows_dropped = int(mask_exact_dup.sum())
-    num_nan_dup_dropped    = int(mask_nan_dup.sum())
-
-    # 7) Construir df_out limpio
-    df_out = df.loc[~rows_to_drop].copy().reset_index(drop=True)
-
-    # Limpieza de columnas auxiliares de stats
-    df_out.drop(columns=["count_rows", "n_notnull", "n_unique_nonnull"], inplace=True)
-
-    # 8) Resumen
-    num_conflictive_rows = int(df_out["is_duplicate_key"].sum())
-    num_keys_with_conflict = int(
-        stats.loc[stats["n_unique_nonnull"] > 1, key_cols].drop_duplicates().shape[0]
-    )
-
-    resumen = {
-        "num_exact_rows_dropped": num_exact_rows_dropped,
-        "num_nan_dup_dropped": num_nan_dup_dropped,
-        "num_conflictive_rows": num_conflictive_rows,
-        "num_keys_with_conflict": num_keys_with_conflict,
-    }
-
-    return df_out, resumen
-
-
+    return df_sin_dups
 
 
 def preparar_estructura_temporal(
